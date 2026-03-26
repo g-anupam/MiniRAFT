@@ -1,0 +1,77 @@
+version: "3.9"
+
+networks:
+  raft-net:
+    driver: bridge
+
+services:
+  # ─── Gateway ────────────────────────────────────────────────────────────────
+  gateway:
+    build: ./gateway
+    container_name: gateway
+    ports:
+      - "8080:8080" # WebSocket + REST port
+    environment:
+      - PORT=8080
+      - REPLICA_URLS=http://replica1:9001,http://replica2:9002,http://replica3:9003
+    depends_on:
+      - replica1
+      - replica2
+      - replica3
+    networks:
+      - raft-net
+    volumes:
+      - ./gateway:/app
+      - /app/node_modules # anonymous volume — protects node_modules from bind mount overwrite
+    restart: unless-stopped
+
+  # ─── Replica 1 ──────────────────────────────────────────────────────────────
+  replica1:
+    build: ./replica1
+    container_name: replica1
+    ports:
+      - "9001:9001" # Exposed for direct debug access
+    environment:
+      - REPLICA_ID=replica1
+      - PORT=9001
+      - PEERS=http://replica2:9002,http://replica3:9003
+      - GATEWAY_URL=http://gateway:8080
+    networks:
+      - raft-net
+    volumes:
+      - ./replica1:/app
+    restart: unless-stopped
+
+  # ─── Replica 2 ──────────────────────────────────────────────────────────────
+  replica2:
+    build: ./replica2
+    container_name: replica2
+    ports:
+      - "9002:9002"
+    environment:
+      - REPLICA_ID=replica2
+      - PORT=9002
+      - PEERS=http://replica1:9001,http://replica3:9003
+      - GATEWAY_URL=http://gateway:8080
+    networks:
+      - raft-net
+    volumes:
+      - ./replica2:/app
+    restart: unless-stopped
+
+  # ─── Replica 3 ──────────────────────────────────────────────────────────────
+  replica3:
+    build: ./replica3
+    container_name: replica3
+    ports:
+      - "9003:9003"
+    environment:
+      - REPLICA_ID=replica3
+      - PORT=9003
+      - PEERS=http://replica1:9001,http://replica2:9002
+      - GATEWAY_URL=http://gateway:8080
+    networks:
+      - raft-net
+    volumes:
+      - ./replica3:/app
+    restart: unless-stopped

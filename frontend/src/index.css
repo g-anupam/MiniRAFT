@@ -1,0 +1,65 @@
+/* ── Reset ───────────────────────────────────────────────────────────────── */
+*,
+*::before,
+*::after {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+}
+
+/* ── Design tokens ───────────────────────────────────────────────────────── */
+:root {
+    --bg: #0d0e11;
+    --bg-panel: #13151a;
+    --bg-card: #1a1d24;
+    --border: #2a2d36;
+    --border-glow: #3d8bff44;
+
+    --text-primary: #e8eaf0;
+    --text-secondary: #8890a4;
+    --text-mono: #6bd4a8;
+
+    --accent: #3d8bff;
+    --accent-dim: #3d8bff22;
+    --leader: #f5a623;
+    --leader-dim: #f5a62322;
+    --follower: #6bd4a8;
+    --danger: #ff5a5a;
+    --danger-dim: #ff5a5a22;
+
+    --radius-sm: 4px;
+    --radius-md: 8px;
+
+    --font-mono: "Space Mono", monospace;
+    --font-body: "DM Sans", sans-serif;
+}
+
+/* ── Base ────────────────────────────────────────────────────────────────── */
+html,
+body,
+#root {
+    height: 100%;
+    width: 100%;
+    overflow: hidden;
+}
+
+body {
+    background: var(--bg);
+    color: var(--text-primary);
+    font-family: var(--font-body);
+    font-size: 14px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+}
+
+/* ── Scrollbars ──────────────────────────────────────────────────────────── */
+::-webkit-scrollbar {
+    width: 4px;
+}
+::-webkit-scrollbar-track {
+    background: var(--bg);
+}
+::-webkit-scrollbar-thumb {
+    background: var(--border);
+    border-radius: 2px;
+}
