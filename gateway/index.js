@@ -1,17 +1,22 @@
 /**
- * MiniRAFT — Gateway Service (Phase 1 Skeleton)
- * ================================================
- * Responsibilities:
- *   - Accept WebSocket connections from browser clients
- *   - Discover the current RAFT leader by polling replicas /status
- *   - Forward strokes from clients to the leader replica
- *   - Broadcast committed strokes back to all connected clients
+ * MiniRAFT — Gateway Service (Phase 2 — Fully Wired)
+ * ====================================================
+ * Phase 2 additions over Phase 1:
+ *   - handleIncomingStroke() actually POSTs to the leader
+ *   - On 409 (not leader) or network error → re-discover leader and retry once
+ *   - POST /committed-stroke → broadcasts the stroke to all WS clients
+ *   - Stroke queue: strokes arriving during leader election are buffered
+ *     and flushed once a new leader is found
  *
- * Phase 1: WebSocket connections are accepted and logged.
- *           Leader discovery polls replicas but takes no action yet.
- *           Stroke forwarding is stubbed (logs payload, doesn't forward).
+ * Endpoints:
+ *   GET  /health              → gateway status
+ *   POST /committed-stroke    → called by leader replica after commit
  *
- * Phase 2: Wire real leader forwarding + broadcast on commit callback.
+ * WebSocket messages:
+ *   client → gateway  { type: "stroke", stroke: {...} }
+ *   gateway → client  { type: "connected", leader }
+ *   gateway → client  { type: "stroke", stroke: {...} }
+ *   gateway → client  { type: "leader_change", leader }
  */
 
 import express from "express";
@@ -32,51 +37,47 @@ console.log(
 
 // ─── State ───────────────────────────────────────────────────────────────────
 
-/**
- * currentLeaderUrl — the HTTP base URL of the replica we believe is leader.
- * null means unknown; gateway will discover on next poll cycle.
- */
 let currentLeaderUrl = null;
+
+/** Strokes queued while there is no known leader (during election) */
+const strokeQueue = [];
+const MAX_QUEUE = 50; // safety cap — drop oldest if queue overflows
 
 /** All connected WebSocket clients */
 const clients = new Set();
 
-// ─── Express + HTTP server ────────────────────────────────────────────────────
+// ─── Express ─────────────────────────────────────────────────────────────────
 
 const app = express();
 app.use(express.json());
 
-/** Health check */
 app.get("/health", (_req, res) => {
   res.json({
     status: "ok",
     connectedClients: clients.size,
     currentLeader: currentLeaderUrl,
+    queuedStrokes: strokeQueue.length,
     replicas: REPLICA_URLS,
   });
 });
 
 /**
  * POST /committed-stroke
- * Called by the leader replica once a stroke has been committed
- * by a majority quorum. Gateway broadcasts it to all WS clients.
- *
- * Phase 1: stub — logs receipt.
- * Phase 2: broadcast to all clients.
+ * Called by the leader once a stroke is committed by majority quorum.
+ * Broadcasts it to every connected WebSocket client.
  */
 app.post("/committed-stroke", (req, res) => {
   const stroke = req.body;
   console.log(
-    `[gateway] /committed-stroke received | stroke_id=${stroke?.stroke_id}`,
+    `[gateway] Committed stroke received | stroke_id=${stroke?.stroke_id} | broadcasting to ${clients.size} client(s)`,
   );
-
-  // TODO Phase 2: broadcast(JSON.stringify({ type: "stroke", stroke }))
-  res.json({ status: "received" });
+  broadcast({ type: "stroke", stroke });
+  res.json({ status: "ok" });
 });
 
 const httpServer = createServer(app);
 
-// ─── WebSocket server ─────────────────────────────────────────────────────────
+// ─── WebSocket ────────────────────────────────────────────────────────────────
 
 const wss = new WebSocketServer({ server: httpServer });
 
@@ -86,19 +87,25 @@ wss.on("connection", (ws, req) => {
     `[gateway] Client connected | total=${clients.size} | ip=${req.socket.remoteAddress}`,
   );
 
+  ws.send(
+    JSON.stringify({
+      type: "connected",
+      message: "Connected to MiniRAFT gateway",
+      leader: currentLeaderUrl,
+    }),
+  );
+
   ws.on("message", (rawData) => {
     let msg;
     try {
       msg = JSON.parse(rawData.toString());
     } catch {
-      console.warn("[gateway] Received non-JSON message, ignoring");
+      console.warn("[gateway] Non-JSON message ignored");
       return;
     }
 
-    console.log(`[gateway] Message received | type=${msg.type}`);
-
     if (msg.type === "stroke") {
-      handleIncomingStroke(msg.stroke, ws);
+      handleIncomingStroke(msg.stroke);
     } else {
       console.warn(`[gateway] Unknown message type: ${msg.type}`);
     }
@@ -110,53 +117,105 @@ wss.on("connection", (ws, req) => {
   });
 
   ws.on("error", (err) => {
-    console.error(`[gateway] WebSocket error: ${err.message}`);
+    console.error(`[gateway] WS error: ${err.message}`);
     clients.delete(ws);
   });
-
-  // Send initial state to newly connected client
-  ws.send(
-    JSON.stringify({
-      type: "connected",
-      message: "Connected to MiniRAFT gateway",
-      leader: currentLeaderUrl,
-    }),
-  );
 });
 
 // ─── Stroke handling ──────────────────────────────────────────────────────────
 
 /**
- * Handles an incoming stroke from a client.
- * Phase 1: logs and stubs — no forwarding yet.
- * Phase 2: forwards to currentLeaderUrl/stroke via HTTP POST.
+ * Forward a stroke from a client to the current leader.
+ * If no leader is known → queue the stroke.
+ * If the leader rejects (409) or is unreachable → re-discover and retry once.
  */
-function handleIncomingStroke(stroke, _senderWs) {
-  console.log(
-    `[gateway] Stroke | id=${stroke?.stroke_id} | color=${stroke?.color} | points=${stroke?.points?.length} | leader=${currentLeaderUrl ?? "unknown"}`,
-  );
-
+async function handleIncomingStroke(stroke) {
   if (!currentLeaderUrl) {
-    console.warn("[gateway] No known leader — stroke dropped (Phase 1 stub)");
-    // TODO Phase 2: queue stroke and retry after leader discovery
+    console.warn(
+      `[gateway] No leader — queuing stroke | stroke_id=${stroke?.stroke_id} | queue_size=${strokeQueue.length + 1}`,
+    );
+    enqueue(stroke);
     return;
   }
 
-  // TODO Phase 2: forward stroke to leader
-  // fetch(`${currentLeaderUrl}/stroke`, {
-  //   method: "POST",
-  //   headers: { "Content-Type": "application/json" },
-  //   body: JSON.stringify(stroke),
-  // })
-  //   .then(...)
-  //   .catch((err) => { ... re-discover leader ... });
+  const success = await forwardStroke(stroke, currentLeaderUrl);
+
+  if (!success) {
+    // Leader may have changed — re-discover and retry once
+    console.warn(
+      "[gateway] Forward failed — re-discovering leader and retrying",
+    );
+    await discoverLeader();
+
+    if (currentLeaderUrl) {
+      await forwardStroke(stroke, currentLeaderUrl);
+    } else {
+      console.warn("[gateway] Still no leader after retry — queuing stroke");
+      enqueue(stroke);
+    }
+  }
 }
 
 /**
- * Broadcast a message to all connected WebSocket clients.
- * Used in Phase 2 when a committed stroke arrives from the leader.
+ * POST the stroke to a specific replica URL.
+ * Returns true on success, false on any error or non-2xx response.
  */
-function broadcast(data) {
+async function forwardStroke(stroke, leaderUrl) {
+  try {
+    const res = await fetch(`${leaderUrl}/stroke`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(stroke),
+      signal: AbortSignal.timeout(1000),
+    });
+
+    if (res.ok) {
+      console.log(
+        `[gateway] Stroke forwarded | stroke_id=${stroke?.stroke_id} | leader=${leaderUrl}`,
+      );
+      return true;
+    }
+
+    if (res.status === 409) {
+      console.warn(`[gateway] 409 from ${leaderUrl} — not the leader anymore`);
+      currentLeaderUrl = null;
+      return false;
+    }
+
+    console.warn(`[gateway] Unexpected ${res.status} from ${leaderUrl}`);
+    return false;
+  } catch (err) {
+    console.error(`[gateway] forwardStroke error: ${err.message}`);
+    currentLeaderUrl = null;
+    return false;
+  }
+}
+
+function enqueue(stroke) {
+  if (strokeQueue.length >= MAX_QUEUE) {
+    const dropped = strokeQueue.shift();
+    console.warn(
+      `[gateway] Queue full — dropped oldest stroke | stroke_id=${dropped?.stroke_id}`,
+    );
+  }
+  strokeQueue.push(stroke);
+}
+
+async function flushQueue() {
+  if (!strokeQueue.length || !currentLeaderUrl) return;
+  console.log(
+    `[gateway] Flushing ${strokeQueue.length} queued stroke(s) → ${currentLeaderUrl}`,
+  );
+  const toFlush = strokeQueue.splice(0);
+  for (const stroke of toFlush) {
+    await forwardStroke(stroke, currentLeaderUrl);
+  }
+}
+
+// ─── Broadcast ────────────────────────────────────────────────────────────────
+
+function broadcast(payload) {
+  const data = JSON.stringify(payload);
   for (const client of clients) {
     if (client.readyState === WebSocket.OPEN) {
       client.send(data);
@@ -167,13 +226,13 @@ function broadcast(data) {
 // ─── Leader discovery ─────────────────────────────────────────────────────────
 
 /**
- * Polls all replica /status endpoints to find the current leader.
- * Updates currentLeaderUrl if a leader is found.
- *
- * Phase 1: polling works, but finding a leader has no downstream effect yet.
- * Phase 2: on leader change, re-route stroke forwarding.
+ * Poll all replicas for /status and find who is leader.
+ * Updates currentLeaderUrl and notifies clients on change.
+ * Also flushes the stroke queue when a new leader is found.
  */
 async function discoverLeader() {
+  let found = null;
+
   for (const replicaUrl of REPLICA_URLS) {
     try {
       const res = await fetch(`${replicaUrl}/status`, {
@@ -184,32 +243,32 @@ async function discoverLeader() {
       const data = await res.json();
 
       if (data.role === "leader") {
-        if (currentLeaderUrl !== replicaUrl) {
-          console.log(
-            `[gateway] Leader discovered/changed: ${replicaUrl} (term=${data.current_term})`,
-          );
-          currentLeaderUrl = replicaUrl;
-        }
-        return; // found it — stop polling
+        found = replicaUrl;
+        break;
       }
     } catch {
       // replica unreachable — try next
     }
   }
 
-  // No leader found this cycle
-  if (currentLeaderUrl !== null) {
-    console.warn("[gateway] No leader found — clearing currentLeaderUrl");
+  if (found && found !== currentLeaderUrl) {
+    console.log(
+      `[gateway] Leader ${currentLeaderUrl ? "changed" : "discovered"}: ${found}`,
+    );
+    currentLeaderUrl = found;
+    broadcast({ type: "leader_change", leader: found });
+    await flushQueue();
+  } else if (!found && currentLeaderUrl !== null) {
+    console.warn("[gateway] No leader found — election in progress");
     currentLeaderUrl = null;
   }
 }
 
-// Poll for leader every 300ms
 setInterval(discoverLeader, 300);
-discoverLeader(); // run immediately on boot
+discoverLeader();
 
 // ─── Start ────────────────────────────────────────────────────────────────────
 
 httpServer.listen(PORT, () => {
-  console.log(`[gateway] HTTP + WebSocket server listening on port ${PORT}`);
+  console.log(`[gateway] Listening on port ${PORT}`);
 });

@@ -1,28 +1,39 @@
 """
-MiniRAFT - Replica Node (Phase 1 Skeleton)
-==========================================
-This file stubs all RAFT RPC endpoints and state management.
-No election or replication logic yet — that comes in Phase 2.
+MiniRAFT - Replica Node (Phase 2 — Full RAFT)
+==============================================
+Implements:
+  - Follower / Candidate / Leader state machine
+  - Randomised election timeout (500-800 ms)
+  - Leader heartbeat every 150 ms
+  - RequestVote RPC  (vote granting with term + log up-to-date check)
+  - AppendEntries RPC (log consistency check, append, commit)
+  - Heartbeat RPC     (reset timer, step down on higher term)
+  - /stroke           (leader appends → replicates → commits → notifies gateway)
+  - /sync-log         (Phase 3 catch-up — already functional, Phase 3 wires the caller)
 
-Endpoints exposed:
-  GET  /status           → current node state (for debugging & gateway discovery)
+Endpoints:
+  GET  /status           → node state (role, term, log length, commit index)
   POST /request-vote     → RAFT RequestVote RPC
   POST /append-entries   → RAFT AppendEntries RPC
   POST /heartbeat        → RAFT Heartbeat RPC
-  POST /sync-log         → Catch-up sync for rejoining nodes
-  POST /stroke           → Receive a stroke from the gateway (leader only)
+  POST /sync-log         → catch-up for rejoining nodes
+  POST /stroke           → accept stroke from gateway (leader only)
 """
 
+import asyncio
 import logging
 import os
+import random
+from contextlib import asynccontextmanager
 from enum import Enum
 from typing import List, Optional
 
+import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-# ─── Logging ────────────────────────────────────────────────────────────────
+# ─── Logging ─────────────────────────────────────────────────────────────────
 
 logging.basicConfig(
     level=logging.INFO,
@@ -31,14 +42,19 @@ logging.basicConfig(
 )
 log = logging.getLogger("replica")
 
-# ─── Config from environment ─────────────────────────────────────────────────
+# ─── Config ──────────────────────────────────────────────────────────────────
 
 REPLICA_ID: str = os.getenv("REPLICA_ID", "replica-unknown")
 PORT: int = int(os.getenv("PORT", "9001"))
 PEERS: List[str] = [p for p in os.getenv("PEERS", "").split(",") if p]
 GATEWAY_URL: str = os.getenv("GATEWAY_URL", "http://gateway:8080")
 
-# ─── RAFT State ──────────────────────────────────────────────────────────────
+ELECTION_TIMEOUT_MIN = 0.5  # seconds
+ELECTION_TIMEOUT_MAX = 0.8
+HEARTBEAT_INTERVAL = 0.15  # seconds
+RPC_TIMEOUT = 0.5  # per-peer HTTP call timeout
+
+# ─── Node state ──────────────────────────────────────────────────────────────
 
 
 class NodeState(str, Enum):
@@ -47,25 +63,242 @@ class NodeState(str, Enum):
     LEADER = "leader"
 
 
-# Node state — will be mutated by RAFT logic in Phase 2
 state = {
     "node_id": REPLICA_ID,
-    "role": NodeState.FOLLOWER,  # always start as follower
+    "role": NodeState.FOLLOWER,
     "current_term": 0,
-    "voted_for": None,  # who we voted for in current term
-    "leader_id": None,  # known leader (None if unknown)
-    "log": [],  # list of {"index": int, "term": int, "entry": dict}
-    "commit_index": -1,  # highest log index known to be committed
-    "peers": PEERS,
+    "voted_for": None,  # candidate_id we voted for in current_term
+    "leader_id": None,
+    "log": [],  # [{"index": int, "term": int, "entry": dict}]
+    "commit_index": -1,
 }
 
-log.info(
-    "Replica %s booting | role=%s | term=%d | peers=%s",
-    REPLICA_ID,
-    state["role"],
-    state["current_term"],
-    PEERS,
-)
+# asyncio primitives — initialised in lifespan
+heartbeat_event: asyncio.Event = None
+state_lock: asyncio.Lock = None
+
+# background task handles
+_election_task: asyncio.Task = None
+_heartbeat_task: asyncio.Task = None
+
+# ─── Log helpers ─────────────────────────────────────────────────────────────
+
+
+def last_log_index() -> int:
+    return state["log"][-1]["index"] if state["log"] else -1
+
+
+def last_log_term() -> int:
+    return state["log"][-1]["term"] if state["log"] else 0
+
+
+def is_log_up_to_date(their_last_index: int, their_last_term: int) -> bool:
+    """True if candidate log is at least as up-to-date as ours (RAFT §5.4.1)."""
+    my_last_term = last_log_term()
+    my_last_index = last_log_index()
+    if their_last_term != my_last_term:
+        return their_last_term > my_last_term
+    return their_last_index >= my_last_index
+
+
+# ─── State transitions ────────────────────────────────────────────────────────
+
+
+async def step_down(new_term: int):
+    """
+    Revert to follower with new_term.
+    Cancels the heartbeat sender if running.
+    Wakes the election timer so it resets cleanly.
+    Must be called while holding state_lock.
+    """
+    global _heartbeat_task
+    state["role"] = NodeState.FOLLOWER
+    state["current_term"] = new_term
+    state["voted_for"] = None
+    state["leader_id"] = None
+    log.info("[%s] Stepped down → FOLLOWER | term=%d", REPLICA_ID, new_term)
+    if _heartbeat_task and not _heartbeat_task.done():
+        _heartbeat_task.cancel()
+    heartbeat_event.set()  # wake election timer so it resets
+
+
+# ─── Election loop ────────────────────────────────────────────────────────────
+
+
+async def election_loop():
+    """
+    Background task — runs for the lifetime of the process.
+
+    Waits for heartbeat_event within a random 500-800 ms window.
+    If the window expires without a heartbeat → start an election.
+    """
+    global _heartbeat_task
+    log.info("[%s] Election timer started", REPLICA_ID)
+
+    while True:
+        heartbeat_event.clear()
+        timeout = random.uniform(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX)
+
+        try:
+            await asyncio.wait_for(heartbeat_event.wait(), timeout=timeout)
+            # Heartbeat or vote-grant arrived — loop back and reset timer
+            continue
+        except asyncio.TimeoutError:
+            pass
+
+        async with state_lock:
+            if state["role"] == NodeState.LEADER:
+                heartbeat_event.set()
+                continue
+
+            # ── Become candidate ─────────────────────────────────────────────
+            state["role"] = NodeState.CANDIDATE
+            state["current_term"] += 1
+            state["voted_for"] = REPLICA_ID
+            state["leader_id"] = None
+            term = state["current_term"]
+            l_index = last_log_index()
+            l_term = last_log_term()
+
+        log.info(
+            "[%s] Election started | term=%d | last_log_index=%d",
+            REPLICA_ID,
+            term,
+            l_index,
+        )
+
+        vote_req = {
+            "term": term,
+            "candidate_id": REPLICA_ID,
+            "last_log_index": l_index,
+            "last_log_term": l_term,
+        }
+
+        async def request_vote_from(peer_url: str):
+            try:
+                async with httpx.AsyncClient() as client:
+                    r = await client.post(
+                        f"{peer_url}/request-vote",
+                        json=vote_req,
+                        timeout=RPC_TIMEOUT,
+                    )
+                return r.json()
+            except Exception as exc:
+                log.warning(
+                    "[%s] RequestVote → %s failed: %s", REPLICA_ID, peer_url, exc
+                )
+                return None
+
+        results = await asyncio.gather(*[request_vote_from(p) for p in PEERS])
+
+        votes = 1  # always vote for ourselves
+        stepped = False
+        for result in results:
+            if result is None:
+                continue
+            if result.get("term", 0) > term:
+                async with state_lock:
+                    await step_down(result["term"])
+                stepped = True
+                break
+            if result.get("vote_granted"):
+                votes += 1
+
+        if stepped:
+            continue
+
+        async with state_lock:
+            # Guard: only promote if still candidate in same term
+            if state["role"] != NodeState.CANDIDATE or state["current_term"] != term:
+                continue
+
+            if votes >= 2:
+                state["role"] = NodeState.LEADER
+                state["leader_id"] = REPLICA_ID
+                log.info(
+                    "[%s] *** BECAME LEADER *** | term=%d | votes=%d",
+                    REPLICA_ID,
+                    term,
+                    votes,
+                )
+                _heartbeat_task = asyncio.create_task(heartbeat_loop())
+                heartbeat_event.set()
+            else:
+                log.info(
+                    "[%s] Election lost | term=%d | votes=%d — retrying",
+                    REPLICA_ID,
+                    term,
+                    votes,
+                )
+                state["role"] = NodeState.FOLLOWER
+                # Don't set heartbeat_event → timer fires again after next random delay
+
+
+# ─── Heartbeat sender loop ────────────────────────────────────────────────────
+
+
+async def heartbeat_loop():
+    """
+    Background task — runs only while this node is Leader.
+    Sends POST /heartbeat to all peers every 150 ms.
+    Steps down automatically if a peer reports a higher term.
+    """
+    log.info("[%s] Heartbeat loop started", REPLICA_ID)
+
+    async def ping(peer_url: str, term: int):
+        try:
+            async with httpx.AsyncClient() as client:
+                r = await client.post(
+                    f"{peer_url}/heartbeat",
+                    json={"term": term, "leader_id": REPLICA_ID},
+                    timeout=RPC_TIMEOUT,
+                )
+            data = r.json()
+            if data.get("term", 0) > term:
+                async with state_lock:
+                    if data["term"] > state["current_term"]:
+                        await step_down(data["term"])
+        except Exception as exc:
+            log.warning("[%s] Heartbeat → %s failed: %s", REPLICA_ID, peer_url, exc)
+
+    while True:
+        async with state_lock:
+            if state["role"] != NodeState.LEADER:
+                log.info("[%s] Heartbeat loop stopping — no longer leader", REPLICA_ID)
+                return
+            term = state["current_term"]
+
+        await asyncio.gather(*[ping(p, term) for p in PEERS])
+        await asyncio.sleep(HEARTBEAT_INTERVAL)
+
+
+# ─── Lifespan ─────────────────────────────────────────────────────────────────
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    global heartbeat_event, state_lock, _election_task
+
+    heartbeat_event = asyncio.Event()
+    state_lock = asyncio.Lock()
+
+    log.info(
+        "[%s] Booting | role=%s | term=%d | peers=%s",
+        REPLICA_ID,
+        state["role"],
+        state["current_term"],
+        PEERS,
+    )
+
+    _election_task = asyncio.create_task(election_loop())
+    yield
+
+    if _election_task and not _election_task.done():
+        _election_task.cancel()
+    if _heartbeat_task and not _heartbeat_task.done():
+        _heartbeat_task.cancel()
+    log.info("[%s] Shutdown complete", REPLICA_ID)
+
 
 # ─── Pydantic schemas ─────────────────────────────────────────────────────────
 
@@ -85,7 +318,7 @@ class VoteResponse(BaseModel):
 class LogEntry(BaseModel):
     index: int
     term: int
-    entry: dict  # will contain stroke data in Phase 2
+    entry: dict
 
 
 class AppendEntriesRequest(BaseModel):
@@ -114,7 +347,7 @@ class HeartbeatResponse(BaseModel):
 
 
 class SyncLogRequest(BaseModel):
-    from_index: int  # send all committed entries from this index onward
+    from_index: int
 
 
 class SyncLogResponse(BaseModel):
@@ -124,14 +357,14 @@ class SyncLogResponse(BaseModel):
 
 class StrokePayload(BaseModel):
     stroke_id: str
-    points: list  # list of {x, y} dicts
+    points: list
     color: str
     width: float
 
 
-# ─── App ─────────────────────────────────────────────────────────────────────
+# ─── FastAPI app ──────────────────────────────────────────────────────────────
 
-app = FastAPI(title=f"MiniRAFT Replica — {REPLICA_ID}")
+app = FastAPI(title=f"MiniRAFT Replica — {REPLICA_ID}", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -140,15 +373,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ─── Debug / health ──────────────────────────────────────────────────────────
+# ─── Endpoints ────────────────────────────────────────────────────────────────
 
 
 @app.get("/status")
-def get_status():
-    """
-    Returns current node state. Used by gateway to discover leader.
-    Also useful for the optional Phase 3 dashboard.
-    """
+async def get_status():
     return {
         "node_id": state["node_id"],
         "role": state["role"],
@@ -156,117 +385,274 @@ def get_status():
         "leader_id": state["leader_id"],
         "log_length": len(state["log"]),
         "commit_index": state["commit_index"],
-        "peers": state["peers"],
+        "peers": PEERS,
     }
 
 
-# ─── RAFT RPC endpoints (Phase 1: stubs only) ────────────────────────────────
-
-
 @app.post("/request-vote", response_model=VoteResponse)
-def request_vote(req: VoteRequest):
-    """
-    RAFT RequestVote RPC.
-    Phase 1: always deny — real election logic added in Phase 2.
-    """
-    log.info(
-        "[%s] /request-vote | from=%s | their_term=%d | our_term=%d",
-        REPLICA_ID,
-        req.candidate_id,
-        req.term,
-        state["current_term"],
-    )
-    # TODO Phase 2: implement election rules
-    #   - if req.term > current_term → update term, reset voted_for
-    #   - grant vote if voted_for is None or req.candidate_id, and log is up-to-date
-    return VoteResponse(term=state["current_term"], vote_granted=False)
+async def request_vote(req: VoteRequest):
+    async with state_lock:
+        # Stale term → deny immediately
+        if req.term < state["current_term"]:
+            log.info(
+                "[%s] Vote DENIED → %s | stale term %d < %d",
+                REPLICA_ID,
+                req.candidate_id,
+                req.term,
+                state["current_term"],
+            )
+            return VoteResponse(term=state["current_term"], vote_granted=False)
+
+        # Higher term → step down and reset voted_for
+        if req.term > state["current_term"]:
+            state["current_term"] = req.term
+            state["voted_for"] = None
+            state["role"] = NodeState.FOLLOWER
+            state["leader_id"] = None
+
+        # Already voted for someone else this term
+        if state["voted_for"] is not None and state["voted_for"] != req.candidate_id:
+            log.info(
+                "[%s] Vote DENIED → %s | already voted for %s in term=%d",
+                REPLICA_ID,
+                req.candidate_id,
+                state["voted_for"],
+                req.term,
+            )
+            return VoteResponse(term=state["current_term"], vote_granted=False)
+
+        # Candidate log must be at least as up-to-date as ours
+        if not is_log_up_to_date(req.last_log_index, req.last_log_term):
+            log.info(
+                "[%s] Vote DENIED → %s | log not up-to-date",
+                REPLICA_ID,
+                req.candidate_id,
+            )
+            return VoteResponse(term=state["current_term"], vote_granted=False)
+
+        state["voted_for"] = req.candidate_id
+        heartbeat_event.set()  # reset our own election timer
+        log.info(
+            "[%s] Vote GRANTED → %s | term=%d",
+            REPLICA_ID,
+            req.candidate_id,
+            req.term,
+        )
+        return VoteResponse(term=state["current_term"], vote_granted=True)
 
 
 @app.post("/append-entries", response_model=AppendEntriesResponse)
-def append_entries(req: AppendEntriesRequest):
-    """
-    RAFT AppendEntries RPC.
-    Phase 1: log receipt only — real replication logic added in Phase 2.
-    """
-    log.info(
-        "[%s] /append-entries | from=%s | term=%d | entries=%d",
-        REPLICA_ID,
-        req.leader_id,
-        req.term,
-        len(req.entries),
-    )
-    # TODO Phase 2: implement log consistency check
-    #   - reject if req.term < current_term
-    #   - check prevLogIndex / prevLogTerm match
-    #   - append new entries, update commit_index
-    return AppendEntriesResponse(
-        term=state["current_term"],
-        success=False,
-        match_index=None,
-    )
+async def append_entries(req: AppendEntriesRequest):
+    async with state_lock:
+        # Stale leader
+        if req.term < state["current_term"]:
+            return AppendEntriesResponse(term=state["current_term"], success=False)
+
+        # Valid leader — accept authority
+        if req.term > state["current_term"]:
+            state["current_term"] = req.term
+            state["voted_for"] = None
+
+        state["role"] = NodeState.FOLLOWER
+        state["leader_id"] = req.leader_id
+        heartbeat_event.set()
+
+        # Log consistency check
+        if req.prev_log_index >= 0:
+            if len(state["log"]) <= req.prev_log_index:
+                log.info(
+                    "[%s] AppendEntries REJECT | missing prev_log_index=%d | our_len=%d",
+                    REPLICA_ID,
+                    req.prev_log_index,
+                    len(state["log"]),
+                )
+                return AppendEntriesResponse(
+                    term=state["current_term"],
+                    success=False,
+                    match_index=len(state["log"]) - 1,
+                )
+
+            if state["log"][req.prev_log_index]["term"] != req.prev_log_term:
+                # Conflicting entry — truncate
+                state["log"] = state["log"][: req.prev_log_index]
+                log.info(
+                    "[%s] AppendEntries REJECT | term mismatch at index=%d — truncated",
+                    REPLICA_ID,
+                    req.prev_log_index,
+                )
+                return AppendEntriesResponse(
+                    term=state["current_term"],
+                    success=False,
+                    match_index=req.prev_log_index - 1,
+                )
+
+        # Append entries (skip any already present with matching term)
+        for e in req.entries:
+            idx = e.index
+            if idx < len(state["log"]):
+                if state["log"][idx]["term"] != e.term:
+                    state["log"] = state["log"][:idx]
+                    state["log"].append(e.dict())
+            else:
+                state["log"].append(e.dict())
+
+        # Advance commit index
+        if req.leader_commit > state["commit_index"]:
+            state["commit_index"] = min(req.leader_commit, last_log_index())
+            log.info("[%s] commit_index → %d", REPLICA_ID, state["commit_index"])
+
+        return AppendEntriesResponse(
+            term=state["current_term"],
+            success=True,
+            match_index=last_log_index(),
+        )
 
 
 @app.post("/heartbeat", response_model=HeartbeatResponse)
-def heartbeat(req: HeartbeatRequest):
-    """
-    RAFT Heartbeat RPC.
-    Phase 1: log receipt only — timer reset logic added in Phase 2.
-    """
-    log.info(
-        "[%s] /heartbeat | from=%s | term=%d",
-        REPLICA_ID,
-        req.leader_id,
-        req.term,
-    )
-    # TODO Phase 2:
-    #   - update current_term if req.term is higher
-    #   - reset election timeout timer
-    #   - record leader_id
-    return HeartbeatResponse(term=state["current_term"], success=True)
+async def heartbeat(req: HeartbeatRequest):
+    async with state_lock:
+        if req.term < state["current_term"]:
+            return HeartbeatResponse(term=state["current_term"], success=False)
+
+        if req.term > state["current_term"]:
+            state["current_term"] = req.term
+            state["voted_for"] = None
+
+        state["role"] = NodeState.FOLLOWER
+        state["leader_id"] = req.leader_id
+        heartbeat_event.set()
+
+        return HeartbeatResponse(term=state["current_term"], success=True)
 
 
 @app.post("/sync-log", response_model=SyncLogResponse)
-def sync_log(req: SyncLogRequest):
+async def sync_log(req: SyncLogRequest):
     """
-    Catch-up RPC. Called by a rejoining follower to request missing entries.
-    Phase 1: returns empty — real sync logic added in Phase 3.
+    Return all committed log entries from req.from_index onward.
+    Called by the leader on a rejoining follower (Phase 3).
+    Already functional — Phase 3 just wires the leader to call it.
     """
-    log.info(
-        "[%s] /sync-log | requested_from_index=%d | our_log_length=%d",
-        REPLICA_ID,
-        req.from_index,
-        len(state["log"]),
-    )
-    # TODO Phase 3: return state["log"][req.from_index:]
-    return SyncLogResponse(entries=[], commit_index=state["commit_index"])
+    async with state_lock:
+        committed = [
+            e
+            for e in state["log"]
+            if e["index"] >= req.from_index and e["index"] <= state["commit_index"]
+        ]
+        log.info(
+            "[%s] /sync-log | from=%d | sending=%d entries",
+            REPLICA_ID,
+            req.from_index,
+            len(committed),
+        )
+        return SyncLogResponse(
+            entries=[LogEntry(**e) for e in committed],
+            commit_index=state["commit_index"],
+        )
 
 
 @app.post("/stroke")
-def receive_stroke(payload: StrokePayload):
+async def receive_stroke(payload: StrokePayload):
     """
-    Called by gateway to submit a new stroke to the leader.
-    Phase 1: log receipt only — real consensus logic added in Phase 2.
+    Gateway submits a new stroke to the leader.
+
+    Flow:
+      1. Append to local log
+      2. Send AppendEntries to all peers concurrently
+      3. Majority ack → mark committed, advance commit_index
+      4. Notify gateway POST /committed-stroke → broadcast to clients
     """
-    if state["role"] != NodeState.LEADER:
-        log.warning(
-            "[%s] /stroke received but I am not leader (role=%s)",
-            REPLICA_ID,
-            state["role"],
+    async with state_lock:
+        if state["role"] != NodeState.LEADER:
+            raise HTTPException(
+                status_code=409,
+                detail=f"{REPLICA_ID} is not the leader (role={state['role']})",
+            )
+        term = state["current_term"]
+        new_index = last_log_index() + 1
+        prev_idx = new_index - 1
+        prev_term = (
+            state["log"][prev_idx]["term"] if prev_idx >= 0 and state["log"] else 0
         )
-        raise HTTPException(
-            status_code=409,
-            detail=f"{REPLICA_ID} is not the leader (role={state['role']})",
+        commit_idx = state["commit_index"]
+
+        new_entry = {"index": new_index, "term": term, "entry": payload.dict()}
+        state["log"].append(new_entry)
+        log.info(
+            "[%s] Stroke appended | index=%d | stroke_id=%s",
+            REPLICA_ID,
+            new_index,
+            payload.stroke_id,
         )
 
-    log.info(
-        "[%s] /stroke | stroke_id=%s | color=%s | points=%d",
+    ae_req = {
+        "term": term,
+        "leader_id": REPLICA_ID,
+        "prev_log_index": prev_idx,
+        "prev_log_term": prev_term,
+        "entries": [new_entry],
+        "leader_commit": commit_idx,
+    }
+
+    async def replicate_to(peer_url: str) -> bool:
+        try:
+            async with httpx.AsyncClient() as client:
+                r = await client.post(
+                    f"{peer_url}/append-entries",
+                    json=ae_req,
+                    timeout=RPC_TIMEOUT,
+                )
+            data = r.json()
+            if data.get("term", 0) > term:
+                async with state_lock:
+                    if data["term"] > state["current_term"]:
+                        await step_down(data["term"])
+                return False
+            return data.get("success", False)
+        except Exception as exc:
+            log.warning("[%s] AppendEntries → %s failed: %s", REPLICA_ID, peer_url, exc)
+            return False
+
+    results = await asyncio.gather(*[replicate_to(p) for p in PEERS])
+    acks = 1 + sum(1 for r in results if r)  # 1 = self
+
+    if acks >= 2:
+        async with state_lock:
+            if state["role"] == NodeState.LEADER:
+                state["commit_index"] = new_index
+                log.info(
+                    "[%s] Stroke COMMITTED | index=%d | acks=%d | stroke_id=%s",
+                    REPLICA_ID,
+                    new_index,
+                    acks,
+                    payload.stroke_id,
+                )
+
+        await _notify_gateway(payload.dict())
+        return {"status": "committed", "index": new_index, "acks": acks}
+
+    log.warning(
+        "[%s] Stroke NOT committed | acks=%d | stroke_id=%s",
         REPLICA_ID,
+        acks,
         payload.stroke_id,
-        payload.color,
-        len(payload.points),
     )
-    # TODO Phase 2:
-    #   - append to local log
-    #   - send AppendEntries to all peers
-    #   - on majority ack → mark committed → notify gateway
-    return {"status": "received", "node_id": REPLICA_ID}
+    raise HTTPException(
+        status_code=503,
+        detail=f"Replication failed — only {acks} acks (need 2)",
+    )
+
+
+async def _notify_gateway(stroke: dict):
+    """POST committed stroke to gateway so it broadcasts to all WS clients."""
+    try:
+        async with httpx.AsyncClient() as client:
+            await client.post(
+                f"{GATEWAY_URL}/committed-stroke",
+                json=stroke,
+                timeout=RPC_TIMEOUT,
+            )
+        log.info(
+            "[%s] Gateway notified | stroke_id=%s", REPLICA_ID, stroke.get("stroke_id")
+        )
+    except Exception as exc:
+        log.warning("[%s] Gateway notify failed: %s", REPLICA_ID, exc)

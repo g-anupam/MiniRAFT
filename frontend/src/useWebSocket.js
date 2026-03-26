@@ -1,13 +1,12 @@
 /**
- * useWebSocket — Phase 1 Skeleton
- * ================================
- * Manages the WebSocket connection to the gateway.
- * - Connects on mount, reconnects on close/error
- * - Parses incoming messages and dispatches them
- * - Exposes sendStroke() for the canvas to call
+ * useWebSocket — Phase 2
+ * =======================
+ * Changes from Phase 1:
+ *   - sendStroke() now actually sends the stroke over WebSocket
+ *   - incoming "stroke" messages call onStroke() to render on canvas
+ *   - "leader_change" messages update local leader state
  *
- * Phase 1: connection + logging only, sendStroke logs to console.
- * Phase 2: sendStroke actually sends; incoming "stroke" messages render on canvas.
+ * Everything else (reconnect loop, message parsing, logging) is unchanged.
  */
 
 import { useEffect, useRef, useState, useCallback } from "react";
@@ -20,7 +19,7 @@ export function useWebSocket({ onStroke }) {
   const wsRef = useRef(null);
   const reconnectTimer = useRef(null);
 
-  const [status, setStatus] = useState("disconnected"); // "disconnected" | "connecting" | "connected"
+  const [status, setStatus] = useState("disconnected");
   const [leader, setLeader] = useState(null);
   const [logs, setLogs] = useState([]);
 
@@ -60,15 +59,15 @@ export function useWebSocket({ onStroke }) {
           break;
 
         case "stroke":
-          // TODO Phase 2: call onStroke(msg.stroke) to render on canvas
+          // Render the committed stroke on the canvas
           addLog(
-            `Stroke received | id=${msg.stroke?.stroke_id} | color=${msg.stroke?.color} | pts=${msg.stroke?.points?.length}`,
+            `Remote stroke | id=${msg.stroke?.stroke_id} | color=${msg.stroke?.color} | pts=${msg.stroke?.points?.length}`,
           );
           onStroke?.(msg.stroke);
           break;
 
         case "leader_change":
-          addLog(`Leader changed → ${msg.leader}`);
+          addLog(`Leader → ${msg.leader ?? "unknown"}`);
           setLeader(msg.leader);
           break;
 
@@ -85,8 +84,8 @@ export function useWebSocket({ onStroke }) {
       reconnectTimer.current = setTimeout(connect, RECONNECT_DELAY_MS);
     };
 
-    ws.onerror = (err) => {
-      addLog(`WebSocket error: ${err.message ?? "unknown"}`);
+    ws.onerror = () => {
+      addLog("WebSocket error");
     };
   }, [addLog, onStroke]);
 
@@ -99,14 +98,13 @@ export function useWebSocket({ onStroke }) {
   }, [connect]);
 
   /**
-   * Serialize and send a completed stroke to the gateway.
-   * Phase 1: logs to console only.
-   * Phase 2: actually sends via WebSocket.
+   * Send a completed stroke to the gateway.
+   * Phase 2: actually transmits over WebSocket.
    */
   const sendStroke = useCallback(
     (stroke) => {
       addLog(
-        `Stroke drawn | id=${stroke.stroke_id} | color=${stroke.color} | pts=${stroke.points.length}`,
+        `Stroke sent | id=${stroke.stroke_id} | color=${stroke.color} | pts=${stroke.points.length}`,
       );
 
       if (wsRef.current?.readyState !== WebSocket.OPEN) {
@@ -114,8 +112,7 @@ export function useWebSocket({ onStroke }) {
         return;
       }
 
-      // TODO Phase 2: uncomment to actually send
-      // wsRef.current.send(JSON.stringify({ type: "stroke", stroke }));
+      wsRef.current.send(JSON.stringify({ type: "stroke", stroke }));
     },
     [addLog],
   );
