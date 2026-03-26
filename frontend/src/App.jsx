@@ -20,13 +20,14 @@ import { DrawingCanvas } from "./DrawingCanvas.jsx";
 import { StatusBar } from "./StatusBar.jsx";
 import { EventLog } from "./EventLog.jsx";
 import { useWebSocket } from "./useWebSocket.js";
+import { useReplicaStatus } from "./useReplicaStatus.js";
 
 export default function App() {
   // Strokes received from other clients (Phase 2: populated via WS)
   const [remoteStrokes, setRemoteStrokes] = useState([]);
 
-  // Replica cluster states (Phase 3: populated via polling /status)
-  const [replicaStates] = useState([]);
+  // Replica cluster states — live polled every second (Phase 3)
+  const replicaStates = useReplicaStatus();
 
   // Called when gateway broadcasts a committed stroke from another client
   const handleRemoteStroke = useCallback((stroke) => {

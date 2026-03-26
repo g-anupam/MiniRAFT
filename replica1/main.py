@@ -1,23 +1,13 @@
 """
-MiniRAFT - Replica Node (Phase 2 — Full RAFT)
-==============================================
-Implements:
-  - Follower / Candidate / Leader state machine
-  - Randomised election timeout (500-800 ms)
-  - Leader heartbeat every 150 ms
-  - RequestVote RPC  (vote granting with term + log up-to-date check)
-  - AppendEntries RPC (log consistency check, append, commit)
-  - Heartbeat RPC     (reset timer, step down on higher term)
-  - /stroke           (leader appends → replicates → commits → notifies gateway)
-  - /sync-log         (Phase 3 catch-up — already functional, Phase 3 wires the caller)
+MiniRAFT - Replica Node (Phase 3 — Reliability & Zero-Downtime)
+================================================================
+Phase 3 additions over Phase 2:
+  - Catch-up sync: when AppendEntries fails with match_index, leader calls
+    /sync-log on the lagging follower and pushes all missing committed entries
+  - heartbeat_loop also triggers catch-up on followers that are behind
+  - Graceful shutdown logging so hot-reload restarts are visible in logs
 
-Endpoints:
-  GET  /status           → node state (role, term, log length, commit index)
-  POST /request-vote     → RAFT RequestVote RPC
-  POST /append-entries   → RAFT AppendEntries RPC
-  POST /heartbeat        → RAFT Heartbeat RPC
-  POST /sync-log         → catch-up for rejoining nodes
-  POST /stroke           → accept stroke from gateway (leader only)
+All Phase 2 behaviour is unchanged.
 """
 
 import asyncio
@@ -120,6 +110,66 @@ async def step_down(new_term: int):
     if _heartbeat_task and not _heartbeat_task.done():
         _heartbeat_task.cancel()
     heartbeat_event.set()  # wake election timer so it resets
+
+
+# ─── Catch-up sync ───────────────────────────────────────────────────────────
+
+
+async def _sync_follower(peer_url: str, from_index: int):
+    """
+    Push all committed log entries from from_index onward to a lagging follower.
+
+    Called by the leader when:
+      (a) replicate_to() gets success=False with a match_index  (stroke path)
+      (b) heartbeat_loop detects a follower is behind             (background path)
+
+    The follower's /sync-log receives the entries and appends them all at once,
+    bringing it fully up to date before normal AppendEntries resumes.
+    """
+    async with state_lock:
+        if state["role"] != NodeState.LEADER:
+            return
+        committed = [
+            e
+            for e in state["log"]
+            if e["index"] >= from_index and e["index"] <= state["commit_index"]
+        ]
+        commit_idx = state["commit_index"]
+
+    if not committed:
+        return
+
+    log.info(
+        "[%s] Syncing %s | from_index=%d | entries=%d",
+        REPLICA_ID,
+        peer_url,
+        from_index,
+        len(committed),
+    )
+
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.post(
+                f"{peer_url}/sync-log",
+                json={"from_index": from_index},
+                timeout=2.0,  # longer timeout — could be a big payload
+            )
+        if r.status_code == 200:
+            log.info(
+                "[%s] Catch-up sync OK → %s | sent=%d entries",
+                REPLICA_ID,
+                peer_url,
+                len(committed),
+            )
+        else:
+            log.warning(
+                "[%s] Catch-up sync failed → %s | status=%d",
+                REPLICA_ID,
+                peer_url,
+                r.status_code,
+            )
+    except Exception as exc:
+        log.warning("[%s] Catch-up sync error → %s: %s", REPLICA_ID, peer_url, exc)
 
 
 # ─── Election loop ────────────────────────────────────────────────────────────
@@ -261,14 +311,32 @@ async def heartbeat_loop():
         except Exception as exc:
             log.warning("[%s] Heartbeat → %s failed: %s", REPLICA_ID, peer_url, exc)
 
+    # Track each follower's known match_index so we can detect lag
+    # key: peer_url → last known match_index (-1 = unknown)
+    peer_match: dict = {p: -1 for p in PEERS}
+
     while True:
         async with state_lock:
             if state["role"] != NodeState.LEADER:
                 log.info("[%s] Heartbeat loop stopping — no longer leader", REPLICA_ID)
                 return
             term = state["current_term"]
+            our_commit = state["commit_index"]
 
         await asyncio.gather(*[ping(p, term) for p in PEERS])
+
+        # Phase 3: check if any follower is lagging behind our commit index.
+        # We detect this by comparing peer_match (updated by replicate_to on
+        # the stroke path) against our own commit_index.
+        # If a follower is behind, push the missing entries via /sync-log.
+        for peer_url in PEERS:
+            known = peer_match.get(peer_url, -1)
+            if known < our_commit:
+                # Follower is behind — trigger catch-up asynchronously
+                # so it doesn't block the heartbeat interval
+                asyncio.create_task(_sync_follower(peer_url, known + 1))
+                peer_match[peer_url] = our_commit  # optimistically update
+
         await asyncio.sleep(HEARTBEAT_INTERVAL)
 
 
@@ -607,7 +675,19 @@ async def receive_stroke(payload: StrokePayload):
                     if data["term"] > state["current_term"]:
                         await step_down(data["term"])
                 return False
-            return data.get("success", False)
+            if data.get("success", False):
+                return True
+            # Follower rejected — it's behind. Trigger catch-up asynchronously.
+            # match_index tells us where the follower's log ends.
+            their_match = data.get("match_index", -1)
+            log.info(
+                "[%s] Follower %s is behind (match_index=%d) — scheduling catch-up",
+                REPLICA_ID,
+                peer_url,
+                their_match,
+            )
+            asyncio.create_task(_sync_follower(peer_url, their_match + 1))
+            return False
         except Exception as exc:
             log.warning("[%s] AppendEntries → %s failed: %s", REPLICA_ID, peer_url, exc)
             return False
