@@ -23,19 +23,26 @@ import { useWebSocket } from "./useWebSocket.js";
 import { useReplicaStatus } from "./useReplicaStatus.js";
 
 export default function App() {
-  // Strokes received from other clients (Phase 2: populated via WS)
+  // All committed strokes — populated on connect via replay, then appended live
   const [remoteStrokes, setRemoteStrokes] = useState([]);
 
   // Replica cluster states — live polled every second (Phase 3)
   const replicaStates = useReplicaStatus();
 
-  // Called when gateway broadcasts a committed stroke from another client
+  // Called when gateway broadcasts a single live committed stroke
   const handleRemoteStroke = useCallback((stroke) => {
     setRemoteStrokes((prev) => [...prev, stroke]);
   }, []);
 
+  // Called once on connect — gateway sends the full committed log
+  // so new tabs immediately see the existing canvas
+  const handleReplay = useCallback((strokes) => {
+    setRemoteStrokes(strokes);
+  }, []);
+
   const { status, leader, logs, sendStroke } = useWebSocket({
     onStroke: handleRemoteStroke,
+    onReplay: handleReplay,
   });
 
   return (

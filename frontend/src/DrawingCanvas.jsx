@@ -59,14 +59,36 @@ export function DrawingCanvas({ onStrokeComplete, externalStrokes = [] }) {
     return () => observer.disconnect();
   }, []);
 
-  // ── Render external strokes (Phase 2: from other clients) ──────────────────
+  // ── Render external strokes ────────────────────────────────────────────────
+  // Two cases:
+  //   1. Live stroke appended (prev.length + 1 === next.length) → draw only the new one
+  //   2. Full replay on connect (array replaced wholesale)       → clear and redraw all
+
+  const prevStrokesLen = useRef(0);
 
   useEffect(() => {
     if (!externalStrokes.length) return;
     const canvas = canvasRef.current;
     const ctx = canvas.getContext("2d");
-    const last = externalStrokes[externalStrokes.length - 1];
-    drawStroke(ctx, last, canvas.width, canvas.height);
+
+    const isAppend = externalStrokes.length === prevStrokesLen.current + 1;
+    prevStrokesLen.current = externalStrokes.length;
+
+    if (isAppend) {
+      // Just draw the newest stroke on top
+      drawStroke(
+        ctx,
+        externalStrokes[externalStrokes.length - 1],
+        canvas.width,
+        canvas.height,
+      );
+    } else {
+      // Full replay — clear the canvas and repaint everything
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      for (const stroke of externalStrokes) {
+        drawStroke(ctx, stroke, canvas.width, canvas.height);
+      }
+    }
   }, [externalStrokes]);
 
   // ── Drawing helpers ──────────────────────────────────────────────────────────

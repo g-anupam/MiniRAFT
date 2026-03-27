@@ -46,6 +46,13 @@ const MAX_QUEUE = 50; // safety cap — drop oldest if queue overflows
 /** All connected WebSocket clients */
 const clients = new Set();
 
+/**
+ * In-memory cache of every committed stroke, in order.
+ * Sent to newly connecting clients so they see the full canvas immediately.
+ * Cleared if the gateway restarts (acceptable — replicas still hold the log).
+ */
+const committedLog = [];
+
 // ─── Express ─────────────────────────────────────────────────────────────────
 
 const app = express();
@@ -68,8 +75,9 @@ app.get("/health", (_req, res) => {
  */
 app.post("/committed-stroke", (req, res) => {
   const stroke = req.body;
+  committedLog.push(stroke);
   console.log(
-    `[gateway] Committed stroke received | stroke_id=${stroke?.stroke_id} | broadcasting to ${clients.size} client(s)`,
+    `[gateway] Committed stroke received | stroke_id=${stroke?.stroke_id} | log_size=${committedLog.length} | broadcasting to ${clients.size} client(s)`,
   );
   broadcast({ type: "stroke", stroke });
   res.json({ status: "ok" });
@@ -87,6 +95,7 @@ wss.on("connection", (ws, req) => {
     `[gateway] Client connected | total=${clients.size} | ip=${req.socket.remoteAddress}`,
   );
 
+  // 1. Send handshake
   ws.send(
     JSON.stringify({
       type: "connected",
@@ -94,6 +103,14 @@ wss.on("connection", (ws, req) => {
       leader: currentLeaderUrl,
     }),
   );
+
+  // 2. Replay the full committed stroke log so the canvas is up to date
+  if (committedLog.length > 0) {
+    console.log(
+      `[gateway] Replaying ${committedLog.length} stroke(s) to new client`,
+    );
+    ws.send(JSON.stringify({ type: "replay", strokes: committedLog }));
+  }
 
   ws.on("message", (rawData) => {
     let msg;

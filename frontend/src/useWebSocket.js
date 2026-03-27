@@ -1,12 +1,11 @@
 /**
- * useWebSocket — Phase 2
- * =======================
- * Changes from Phase 1:
- *   - sendStroke() now actually sends the stroke over WebSocket
- *   - incoming "stroke" messages call onStroke() to render on canvas
- *   - "leader_change" messages update local leader state
- *
- * Everything else (reconnect loop, message parsing, logging) is unchanged.
+ * useWebSocket — Bugfix update
+ * =============================
+ * Fixes:
+ *   1. connect() no longer depends on onStroke — uses a stable ref instead,
+ *      which stops the WebSocket from tearing down and recreating on every render.
+ *   2. Handles new "replay" message type — fires onReplay(strokes) to paint
+ *      the full existing canvas when a new tab connects.
  */
 
 import { useEffect, useRef, useState, useCallback } from "react";
@@ -15,9 +14,19 @@ const GATEWAY_WS_URL =
   import.meta.env.VITE_GATEWAY_WS_URL ?? "ws://localhost:8080";
 const RECONNECT_DELAY_MS = 2000;
 
-export function useWebSocket({ onStroke }) {
+export function useWebSocket({ onStroke, onReplay }) {
   const wsRef = useRef(null);
   const reconnectTimer = useRef(null);
+
+  // Stable refs so connect() never needs them as dependencies
+  const onStrokeRef = useRef(onStroke);
+  const onReplayRef = useRef(onReplay);
+  useEffect(() => {
+    onStrokeRef.current = onStroke;
+  }, [onStroke]);
+  useEffect(() => {
+    onReplayRef.current = onReplay;
+  }, [onReplay]);
 
   const [status, setStatus] = useState("disconnected");
   const [leader, setLeader] = useState(null);
@@ -29,6 +38,9 @@ export function useWebSocket({ onStroke }) {
     console.log(`[ws] ${msg}`);
   }, []);
 
+  // connect has NO dependency on onStroke/onReplay — uses refs instead.
+  // This means the WebSocket is created exactly once and never torn down
+  // due to a prop change.
   const connect = useCallback(() => {
     if (wsRef.current?.readyState === WebSocket.OPEN) return;
 
@@ -58,12 +70,18 @@ export function useWebSocket({ onStroke }) {
           setLeader(msg.leader);
           break;
 
+        case "replay":
+          // Full canvas history sent on connect — paint all strokes at once
+          addLog(`Replaying ${msg.strokes?.length ?? 0} existing stroke(s)`);
+          onReplayRef.current?.(msg.strokes ?? []);
+          break;
+
         case "stroke":
-          // Render the committed stroke on the canvas
+          // Live committed stroke from another client
           addLog(
             `Remote stroke | id=${msg.stroke?.stroke_id} | color=${msg.stroke?.color} | pts=${msg.stroke?.points?.length}`,
           );
-          onStroke?.(msg.stroke);
+          onStrokeRef.current?.(msg.stroke);
           break;
 
         case "leader_change":
@@ -87,7 +105,7 @@ export function useWebSocket({ onStroke }) {
     ws.onerror = () => {
       addLog("WebSocket error");
     };
-  }, [addLog, onStroke]);
+  }, [addLog]); // ← addLog only — no onStroke, no onReplay
 
   useEffect(() => {
     connect();
@@ -97,21 +115,15 @@ export function useWebSocket({ onStroke }) {
     };
   }, [connect]);
 
-  /**
-   * Send a completed stroke to the gateway.
-   * Phase 2: actually transmits over WebSocket.
-   */
   const sendStroke = useCallback(
     (stroke) => {
       addLog(
         `Stroke sent | id=${stroke.stroke_id} | color=${stroke.color} | pts=${stroke.points.length}`,
       );
-
       if (wsRef.current?.readyState !== WebSocket.OPEN) {
         addLog("Cannot send — not connected");
         return;
       }
-
       wsRef.current.send(JSON.stringify({ type: "stroke", stroke }));
     },
     [addLog],
