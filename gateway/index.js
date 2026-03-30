@@ -31,9 +31,7 @@ const REPLICA_URLS = (process.env.REPLICA_URLS ?? "")
   .map((u) => u.trim())
   .filter(Boolean);
 
-console.log(
-  `[gateway] Starting | port=${PORT} | replicas=${REPLICA_URLS.join(", ")}`,
-);
+console.log(`[gateway] Starting | port=${PORT} | replicas=${REPLICA_URLS.join(", ")}`);
 
 // ─── State ───────────────────────────────────────────────────────────────────
 
@@ -41,7 +39,7 @@ let currentLeaderUrl = null;
 
 /** Strokes queued while there is no known leader (during election) */
 const strokeQueue = [];
-const MAX_QUEUE = 50; // safety cap — drop oldest if queue overflows
+const MAX_QUEUE   = 50;   // safety cap — drop oldest if queue overflows
 
 /** All connected WebSocket clients */
 const clients = new Set();
@@ -60,11 +58,11 @@ app.use(express.json());
 
 app.get("/health", (_req, res) => {
   res.json({
-    status: "ok",
+    status:           "ok",
     connectedClients: clients.size,
-    currentLeader: currentLeaderUrl,
-    queuedStrokes: strokeQueue.length,
-    replicas: REPLICA_URLS,
+    currentLeader:    currentLeaderUrl,
+    queuedStrokes:    strokeQueue.length,
+    replicas:         REPLICA_URLS,
   });
 });
 
@@ -75,10 +73,19 @@ app.get("/health", (_req, res) => {
  */
 app.post("/committed-stroke", (req, res) => {
   const stroke = req.body;
-  committedLog.push(stroke);
-  console.log(
-    `[gateway] Committed stroke received | stroke_id=${stroke?.stroke_id} | log_size=${committedLog.length} | broadcasting to ${clients.size} client(s)`,
-  );
+
+  if (stroke?.type === "clear") {
+    // Wipe the log — new tabs joining after a clear should start blank,
+    // not replay everything before the clear
+    committedLog.length = 0;
+    console.log(`[gateway] Clear event committed — log wiped | broadcasting to ${clients.size} client(s)`);
+  } else {
+    committedLog.push(stroke);
+    console.log(
+      `[gateway] Committed stroke received | stroke_id=${stroke?.stroke_id} | log_size=${committedLog.length} | broadcasting to ${clients.size} client(s)`
+    );
+  }
+
   broadcast({ type: "stroke", stroke });
   res.json({ status: "ok" });
 });
@@ -92,23 +99,21 @@ const wss = new WebSocketServer({ server: httpServer });
 wss.on("connection", (ws, req) => {
   clients.add(ws);
   console.log(
-    `[gateway] Client connected | total=${clients.size} | ip=${req.socket.remoteAddress}`,
+    `[gateway] Client connected | total=${clients.size} | ip=${req.socket.remoteAddress}`
   );
 
   // 1. Send handshake
   ws.send(
     JSON.stringify({
-      type: "connected",
+      type:    "connected",
       message: "Connected to MiniRAFT gateway",
-      leader: currentLeaderUrl,
-    }),
+      leader:  currentLeaderUrl,
+    })
   );
 
   // 2. Replay the full committed stroke log so the canvas is up to date
   if (committedLog.length > 0) {
-    console.log(
-      `[gateway] Replaying ${committedLog.length} stroke(s) to new client`,
-    );
+    console.log(`[gateway] Replaying ${committedLog.length} stroke(s) to new client`);
     ws.send(JSON.stringify({ type: "replay", strokes: committedLog }));
   }
 
@@ -149,7 +154,7 @@ wss.on("connection", (ws, req) => {
 async function handleIncomingStroke(stroke) {
   if (!currentLeaderUrl) {
     console.warn(
-      `[gateway] No leader — queuing stroke | stroke_id=${stroke?.stroke_id} | queue_size=${strokeQueue.length + 1}`,
+      `[gateway] No leader — queuing stroke | stroke_id=${stroke?.stroke_id} | queue_size=${strokeQueue.length + 1}`
     );
     enqueue(stroke);
     return;
@@ -159,9 +164,7 @@ async function handleIncomingStroke(stroke) {
 
   if (!success) {
     // Leader may have changed — re-discover and retry once
-    console.warn(
-      "[gateway] Forward failed — re-discovering leader and retrying",
-    );
+    console.warn("[gateway] Forward failed — re-discovering leader and retrying");
     await discoverLeader();
 
     if (currentLeaderUrl) {
@@ -180,27 +183,30 @@ async function handleIncomingStroke(stroke) {
 async function forwardStroke(stroke, leaderUrl) {
   try {
     const res = await fetch(`${leaderUrl}/stroke`, {
-      method: "POST",
+      method:  "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(stroke),
-      signal: AbortSignal.timeout(1000),
+      body:    JSON.stringify(stroke),
+      signal:  AbortSignal.timeout(1000),
     });
 
     if (res.ok) {
       console.log(
-        `[gateway] Stroke forwarded | stroke_id=${stroke?.stroke_id} | leader=${leaderUrl}`,
+        `[gateway] Stroke forwarded | stroke_id=${stroke?.stroke_id} | leader=${leaderUrl}`
       );
       return true;
     }
 
     if (res.status === 409) {
-      console.warn(`[gateway] 409 from ${leaderUrl} — not the leader anymore`);
+      console.warn(
+        `[gateway] 409 from ${leaderUrl} — not the leader anymore`
+      );
       currentLeaderUrl = null;
       return false;
     }
 
     console.warn(`[gateway] Unexpected ${res.status} from ${leaderUrl}`);
     return false;
+
   } catch (err) {
     console.error(`[gateway] forwardStroke error: ${err.message}`);
     currentLeaderUrl = null;
@@ -211,9 +217,7 @@ async function forwardStroke(stroke, leaderUrl) {
 function enqueue(stroke) {
   if (strokeQueue.length >= MAX_QUEUE) {
     const dropped = strokeQueue.shift();
-    console.warn(
-      `[gateway] Queue full — dropped oldest stroke | stroke_id=${dropped?.stroke_id}`,
-    );
+    console.warn(`[gateway] Queue full — dropped oldest stroke | stroke_id=${dropped?.stroke_id}`);
   }
   strokeQueue.push(stroke);
 }
@@ -221,7 +225,7 @@ function enqueue(stroke) {
 async function flushQueue() {
   if (!strokeQueue.length || !currentLeaderUrl) return;
   console.log(
-    `[gateway] Flushing ${strokeQueue.length} queued stroke(s) → ${currentLeaderUrl}`,
+    `[gateway] Flushing ${strokeQueue.length} queued stroke(s) → ${currentLeaderUrl}`
   );
   const toFlush = strokeQueue.splice(0);
   for (const stroke of toFlush) {
@@ -270,7 +274,7 @@ async function discoverLeader() {
 
   if (found && found !== currentLeaderUrl) {
     console.log(
-      `[gateway] Leader ${currentLeaderUrl ? "changed" : "discovered"}: ${found}`,
+      `[gateway] Leader ${currentLeaderUrl ? "changed" : "discovered"}: ${found}`
     );
     currentLeaderUrl = found;
     broadcast({ type: "leader_change", leader: found });

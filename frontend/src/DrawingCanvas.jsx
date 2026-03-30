@@ -16,15 +16,7 @@
 
 import { useRef, useEffect, useCallback, useState } from "react";
 
-const COLORS = [
-  "#3d8bff",
-  "#6bd4a8",
-  "#f5a623",
-  "#ff5a5a",
-  "#c084fc",
-  "#fb7185",
-  "#e8eaf0",
-];
+const COLORS = ["#3d8bff", "#6bd4a8", "#f5a623", "#ff5a5a", "#c084fc", "#fb7185", "#e8eaf0"];
 
 function generateId() {
   return Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
@@ -60,33 +52,37 @@ export function DrawingCanvas({ onStrokeComplete, externalStrokes = [] }) {
   }, []);
 
   // ── Render external strokes ────────────────────────────────────────────────
-  // Two cases:
-  //   1. Live stroke appended (prev.length + 1 === next.length) → draw only the new one
-  //   2. Full replay on connect (array replaced wholesale)       → clear and redraw all
+  // Three cases:
+  //   1. Live stroke appended   → draw only the new one
+  //   2. Live clear appended    → clear the canvas
+  //   3. Full replay on connect → clear and redraw all (skipping clear entries)
 
   const prevStrokesLen = useRef(0);
 
   useEffect(() => {
     if (!externalStrokes.length) return;
     const canvas = canvasRef.current;
-    const ctx = canvas.getContext("2d");
+    const ctx    = canvas.getContext("2d");
 
     const isAppend = externalStrokes.length === prevStrokesLen.current + 1;
     prevStrokesLen.current = externalStrokes.length;
 
     if (isAppend) {
-      // Just draw the newest stroke on top
-      drawStroke(
-        ctx,
-        externalStrokes[externalStrokes.length - 1],
-        canvas.width,
-        canvas.height,
-      );
+      const latest = externalStrokes[externalStrokes.length - 1];
+      if (latest.type === "clear") {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+      } else {
+        drawStroke(ctx, latest, canvas.width, canvas.height);
+      }
     } else {
-      // Full replay — clear the canvas and repaint everything
+      // Full replay — clear then repaint, honouring any clear events in sequence
       ctx.clearRect(0, 0, canvas.width, canvas.height);
       for (const stroke of externalStrokes) {
-        drawStroke(ctx, stroke, canvas.width, canvas.height);
+        if (stroke.type === "clear") {
+          ctx.clearRect(0, 0, canvas.width, canvas.height);
+        } else {
+          drawStroke(ctx, stroke, canvas.width, canvas.height);
+        }
       }
     }
   }, [externalStrokes]);
@@ -133,7 +129,7 @@ export function DrawingCanvas({ onStrokeComplete, externalStrokes = [] }) {
       ctx.strokeStyle = activeColor;
       ctx.lineWidth = brushSize;
     },
-    [activeColor, brushSize],
+    [activeColor, brushSize]
   );
 
   const draw = useCallback((e) => {
@@ -160,9 +156,9 @@ export function DrawingCanvas({ onStrokeComplete, externalStrokes = [] }) {
 
     const stroke = {
       stroke_id: generateId(),
-      points: currentPoints.current,
-      color: activeColor,
-      width: brushSize,
+      points:    currentPoints.current,
+      color:     activeColor,
+      width:     brushSize,
     };
 
     currentPoints.current = [];
@@ -170,10 +166,20 @@ export function DrawingCanvas({ onStrokeComplete, externalStrokes = [] }) {
   }, [activeColor, brushSize, onStrokeComplete]);
 
   const clearCanvas = useCallback(() => {
+    // Clear locally immediately for snappy UX
     const canvas = canvasRef.current;
     const ctx = canvas.getContext("2d");
     ctx.clearRect(0, 0, canvas.width, canvas.height);
-  }, []);
+
+    // Send clear through RAFT pipeline so all other tabs clear too
+    onStrokeComplete?.({
+      stroke_id: generateId(),
+      type:      "clear",
+      points:    [],
+      color:     "",
+      width:     0,
+    });
+  }, [onStrokeComplete]);
 
   // ── Render ───────────────────────────────────────────────────────────────────
 
@@ -190,10 +196,7 @@ export function DrawingCanvas({ onStrokeComplete, externalStrokes = [] }) {
               style={{
                 ...styles.swatch,
                 background: c,
-                boxShadow:
-                  activeColor === c
-                    ? `0 0 0 2px #0d0e11, 0 0 0 4px ${c}`
-                    : "none",
+                boxShadow: activeColor === c ? `0 0 0 2px #0d0e11, 0 0 0 4px ${c}` : "none",
               }}
               title={c}
             />
@@ -211,9 +214,7 @@ export function DrawingCanvas({ onStrokeComplete, externalStrokes = [] }) {
         />
         <span style={{ ...styles.toolLabel, minWidth: 24 }}>{brushSize}px</span>
 
-        <button onClick={clearCanvas} style={styles.clearBtn}>
-          CLEAR
-        </button>
+        <button onClick={clearCanvas} style={styles.clearBtn}>CLEAR</button>
       </div>
 
       {/* Canvas */}

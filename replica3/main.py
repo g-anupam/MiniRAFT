@@ -34,45 +34,43 @@ log = logging.getLogger("replica")
 
 # ─── Config ──────────────────────────────────────────────────────────────────
 
-REPLICA_ID: str = os.getenv("REPLICA_ID", "replica-unknown")
-PORT: int = int(os.getenv("PORT", "9001"))
+REPLICA_ID: str  = os.getenv("REPLICA_ID", "replica-unknown")
+PORT: int        = int(os.getenv("PORT", "9001"))
 PEERS: List[str] = [p for p in os.getenv("PEERS", "").split(",") if p]
 GATEWAY_URL: str = os.getenv("GATEWAY_URL", "http://gateway:8080")
 
-ELECTION_TIMEOUT_MIN = 0.5  # seconds
+ELECTION_TIMEOUT_MIN = 0.5    # seconds
 ELECTION_TIMEOUT_MAX = 0.8
-HEARTBEAT_INTERVAL = 0.15  # seconds
-RPC_TIMEOUT = 0.5  # per-peer HTTP call timeout
+HEARTBEAT_INTERVAL   = 0.15   # seconds
+RPC_TIMEOUT          = 0.5    # per-peer HTTP call timeout
 
 # ─── Node state ──────────────────────────────────────────────────────────────
 
-
 class NodeState(str, Enum):
-    FOLLOWER = "follower"
+    FOLLOWER  = "follower"
     CANDIDATE = "candidate"
-    LEADER = "leader"
+    LEADER    = "leader"
 
 
 state = {
-    "node_id": REPLICA_ID,
-    "role": NodeState.FOLLOWER,
+    "node_id":      REPLICA_ID,
+    "role":         NodeState.FOLLOWER,
     "current_term": 0,
-    "voted_for": None,  # candidate_id we voted for in current_term
-    "leader_id": None,
-    "log": [],  # [{"index": int, "term": int, "entry": dict}]
+    "voted_for":    None,   # candidate_id we voted for in current_term
+    "leader_id":    None,
+    "log":          [],     # [{"index": int, "term": int, "entry": dict}]
     "commit_index": -1,
 }
 
 # asyncio primitives — initialised in lifespan
 heartbeat_event: asyncio.Event = None
-state_lock: asyncio.Lock = None
+state_lock: asyncio.Lock       = None
 
 # background task handles
-_election_task: asyncio.Task = None
+_election_task: asyncio.Task  = None
 _heartbeat_task: asyncio.Task = None
 
 # ─── Log helpers ─────────────────────────────────────────────────────────────
-
 
 def last_log_index() -> int:
     return state["log"][-1]["index"] if state["log"] else -1
@@ -84,15 +82,13 @@ def last_log_term() -> int:
 
 def is_log_up_to_date(their_last_index: int, their_last_term: int) -> bool:
     """True if candidate log is at least as up-to-date as ours (RAFT §5.4.1)."""
-    my_last_term = last_log_term()
+    my_last_term  = last_log_term()
     my_last_index = last_log_index()
     if their_last_term != my_last_term:
         return their_last_term > my_last_term
     return their_last_index >= my_last_index
 
-
 # ─── State transitions ────────────────────────────────────────────────────────
-
 
 async def step_down(new_term: int):
     """
@@ -102,18 +98,16 @@ async def step_down(new_term: int):
     Must be called while holding state_lock.
     """
     global _heartbeat_task
-    state["role"] = NodeState.FOLLOWER
+    state["role"]         = NodeState.FOLLOWER
     state["current_term"] = new_term
-    state["voted_for"] = None
-    state["leader_id"] = None
+    state["voted_for"]    = None
+    state["leader_id"]    = None
     log.info("[%s] Stepped down → FOLLOWER | term=%d", REPLICA_ID, new_term)
     if _heartbeat_task and not _heartbeat_task.done():
         _heartbeat_task.cancel()
-    heartbeat_event.set()  # wake election timer so it resets
-
+    heartbeat_event.set()   # wake election timer so it resets
 
 # ─── Catch-up sync ───────────────────────────────────────────────────────────
-
 
 async def _sync_follower(peer_url: str, from_index: int):
     """
@@ -130,8 +124,7 @@ async def _sync_follower(peer_url: str, from_index: int):
         if state["role"] != NodeState.LEADER:
             return
         committed = [
-            e
-            for e in state["log"]
+            e for e in state["log"]
             if e["index"] >= from_index and e["index"] <= state["commit_index"]
         ]
         commit_idx = state["commit_index"]
@@ -141,10 +134,7 @@ async def _sync_follower(peer_url: str, from_index: int):
 
     log.info(
         "[%s] Syncing %s | from_index=%d | entries=%d",
-        REPLICA_ID,
-        peer_url,
-        from_index,
-        len(committed),
+        REPLICA_ID, peer_url, from_index, len(committed),
     )
 
     try:
@@ -152,28 +142,22 @@ async def _sync_follower(peer_url: str, from_index: int):
             r = await client.post(
                 f"{peer_url}/sync-log",
                 json={"from_index": from_index},
-                timeout=2.0,  # longer timeout — could be a big payload
+                timeout=2.0,   # longer timeout — could be a big payload
             )
         if r.status_code == 200:
             log.info(
                 "[%s] Catch-up sync OK → %s | sent=%d entries",
-                REPLICA_ID,
-                peer_url,
-                len(committed),
+                REPLICA_ID, peer_url, len(committed),
             )
         else:
             log.warning(
                 "[%s] Catch-up sync failed → %s | status=%d",
-                REPLICA_ID,
-                peer_url,
-                r.status_code,
+                REPLICA_ID, peer_url, r.status_code,
             )
     except Exception as exc:
         log.warning("[%s] Catch-up sync error → %s: %s", REPLICA_ID, peer_url, exc)
 
-
 # ─── Election loop ────────────────────────────────────────────────────────────
-
 
 async def election_loop():
     """
@@ -202,26 +186,24 @@ async def election_loop():
                 continue
 
             # ── Become candidate ─────────────────────────────────────────────
-            state["role"] = NodeState.CANDIDATE
+            state["role"]          = NodeState.CANDIDATE
             state["current_term"] += 1
-            state["voted_for"] = REPLICA_ID
-            state["leader_id"] = None
-            term = state["current_term"]
+            state["voted_for"]     = REPLICA_ID
+            state["leader_id"]     = None
+            term    = state["current_term"]
             l_index = last_log_index()
-            l_term = last_log_term()
+            l_term  = last_log_term()
 
         log.info(
             "[%s] Election started | term=%d | last_log_index=%d",
-            REPLICA_ID,
-            term,
-            l_index,
+            REPLICA_ID, term, l_index,
         )
 
         vote_req = {
-            "term": term,
-            "candidate_id": REPLICA_ID,
+            "term":           term,
+            "candidate_id":   REPLICA_ID,
             "last_log_index": l_index,
-            "last_log_term": l_term,
+            "last_log_term":  l_term,
         }
 
         async def request_vote_from(peer_url: str):
@@ -234,14 +216,12 @@ async def election_loop():
                     )
                 return r.json()
             except Exception as exc:
-                log.warning(
-                    "[%s] RequestVote → %s failed: %s", REPLICA_ID, peer_url, exc
-                )
+                log.warning("[%s] RequestVote → %s failed: %s", REPLICA_ID, peer_url, exc)
                 return None
 
         results = await asyncio.gather(*[request_vote_from(p) for p in PEERS])
 
-        votes = 1  # always vote for ourselves
+        votes = 1   # always vote for ourselves
         stepped = False
         for result in results:
             if result is None:
@@ -263,29 +243,23 @@ async def election_loop():
                 continue
 
             if votes >= 2:
-                state["role"] = NodeState.LEADER
+                state["role"]      = NodeState.LEADER
                 state["leader_id"] = REPLICA_ID
                 log.info(
                     "[%s] *** BECAME LEADER *** | term=%d | votes=%d",
-                    REPLICA_ID,
-                    term,
-                    votes,
+                    REPLICA_ID, term, votes,
                 )
                 _heartbeat_task = asyncio.create_task(heartbeat_loop())
                 heartbeat_event.set()
             else:
                 log.info(
                     "[%s] Election lost | term=%d | votes=%d — retrying",
-                    REPLICA_ID,
-                    term,
-                    votes,
+                    REPLICA_ID, term, votes,
                 )
                 state["role"] = NodeState.FOLLOWER
                 # Don't set heartbeat_event → timer fires again after next random delay
 
-
 # ─── Heartbeat sender loop ────────────────────────────────────────────────────
-
 
 async def heartbeat_loop():
     """
@@ -320,7 +294,7 @@ async def heartbeat_loop():
             if state["role"] != NodeState.LEADER:
                 log.info("[%s] Heartbeat loop stopping — no longer leader", REPLICA_ID)
                 return
-            term = state["current_term"]
+            term       = state["current_term"]
             our_commit = state["commit_index"]
 
         await asyncio.gather(*[ping(p, term) for p in PEERS])
@@ -335,27 +309,22 @@ async def heartbeat_loop():
                 # Follower is behind — trigger catch-up asynchronously
                 # so it doesn't block the heartbeat interval
                 asyncio.create_task(_sync_follower(peer_url, known + 1))
-                peer_match[peer_url] = our_commit  # optimistically update
+                peer_match[peer_url] = our_commit   # optimistically update
 
         await asyncio.sleep(HEARTBEAT_INTERVAL)
 
-
 # ─── Lifespan ─────────────────────────────────────────────────────────────────
-
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     global heartbeat_event, state_lock, _election_task
 
     heartbeat_event = asyncio.Event()
-    state_lock = asyncio.Lock()
+    state_lock      = asyncio.Lock()
 
     log.info(
         "[%s] Booting | role=%s | term=%d | peers=%s",
-        REPLICA_ID,
-        state["role"],
-        state["current_term"],
-        PEERS,
+        REPLICA_ID, state["role"], state["current_term"], PEERS,
     )
 
     _election_task = asyncio.create_task(election_loop())
@@ -367,68 +336,57 @@ async def lifespan(_app: FastAPI):
         _heartbeat_task.cancel()
     log.info("[%s] Shutdown complete", REPLICA_ID)
 
-
 # ─── Pydantic schemas ─────────────────────────────────────────────────────────
 
-
 class VoteRequest(BaseModel):
-    term: int
-    candidate_id: str
+    term:           int
+    candidate_id:   str
     last_log_index: int
-    last_log_term: int
-
+    last_log_term:  int
 
 class VoteResponse(BaseModel):
-    term: int
+    term:         int
     vote_granted: bool
-
 
 class LogEntry(BaseModel):
     index: int
-    term: int
+    term:  int
     entry: dict
 
-
 class AppendEntriesRequest(BaseModel):
-    term: int
-    leader_id: str
+    term:           int
+    leader_id:      str
     prev_log_index: int
-    prev_log_term: int
-    entries: List[LogEntry]
-    leader_commit: int
-
+    prev_log_term:  int
+    entries:        List[LogEntry]
+    leader_commit:  int
 
 class AppendEntriesResponse(BaseModel):
-    term: int
-    success: bool
+    term:        int
+    success:     bool
     match_index: Optional[int] = None
 
-
 class HeartbeatRequest(BaseModel):
-    term: int
+    term:      int
     leader_id: str
 
-
 class HeartbeatResponse(BaseModel):
-    term: int
+    term:    int
     success: bool
-
 
 class SyncLogRequest(BaseModel):
     from_index: int
 
-
 class SyncLogResponse(BaseModel):
-    entries: List[LogEntry]
+    entries:      List[LogEntry]
     commit_index: int
-
 
 class StrokePayload(BaseModel):
     stroke_id: str
-    points: list
-    color: str
-    width: float
-
+    type:      str = "stroke"   # "stroke" | "clear"
+    points:    list = []
+    color:     str = ""
+    width:     float = 0
 
 # ─── FastAPI app ──────────────────────────────────────────────────────────────
 
@@ -443,17 +401,16 @@ app.add_middleware(
 
 # ─── Endpoints ────────────────────────────────────────────────────────────────
 
-
 @app.get("/status")
 async def get_status():
     return {
-        "node_id": state["node_id"],
-        "role": state["role"],
+        "node_id":      state["node_id"],
+        "role":         state["role"],
         "current_term": state["current_term"],
-        "leader_id": state["leader_id"],
-        "log_length": len(state["log"]),
+        "leader_id":    state["leader_id"],
+        "log_length":   len(state["log"]),
         "commit_index": state["commit_index"],
-        "peers": PEERS,
+        "peers":        PEERS,
     }
 
 
@@ -464,28 +421,22 @@ async def request_vote(req: VoteRequest):
         if req.term < state["current_term"]:
             log.info(
                 "[%s] Vote DENIED → %s | stale term %d < %d",
-                REPLICA_ID,
-                req.candidate_id,
-                req.term,
-                state["current_term"],
+                REPLICA_ID, req.candidate_id, req.term, state["current_term"],
             )
             return VoteResponse(term=state["current_term"], vote_granted=False)
 
         # Higher term → step down and reset voted_for
         if req.term > state["current_term"]:
             state["current_term"] = req.term
-            state["voted_for"] = None
-            state["role"] = NodeState.FOLLOWER
-            state["leader_id"] = None
+            state["voted_for"]    = None
+            state["role"]         = NodeState.FOLLOWER
+            state["leader_id"]    = None
 
         # Already voted for someone else this term
         if state["voted_for"] is not None and state["voted_for"] != req.candidate_id:
             log.info(
                 "[%s] Vote DENIED → %s | already voted for %s in term=%d",
-                REPLICA_ID,
-                req.candidate_id,
-                state["voted_for"],
-                req.term,
+                REPLICA_ID, req.candidate_id, state["voted_for"], req.term,
             )
             return VoteResponse(term=state["current_term"], vote_granted=False)
 
@@ -493,18 +444,15 @@ async def request_vote(req: VoteRequest):
         if not is_log_up_to_date(req.last_log_index, req.last_log_term):
             log.info(
                 "[%s] Vote DENIED → %s | log not up-to-date",
-                REPLICA_ID,
-                req.candidate_id,
+                REPLICA_ID, req.candidate_id,
             )
             return VoteResponse(term=state["current_term"], vote_granted=False)
 
         state["voted_for"] = req.candidate_id
-        heartbeat_event.set()  # reset our own election timer
+        heartbeat_event.set()   # reset our own election timer
         log.info(
             "[%s] Vote GRANTED → %s | term=%d",
-            REPLICA_ID,
-            req.candidate_id,
-            req.term,
+            REPLICA_ID, req.candidate_id, req.term,
         )
         return VoteResponse(term=state["current_term"], vote_granted=True)
 
@@ -519,9 +467,9 @@ async def append_entries(req: AppendEntriesRequest):
         # Valid leader — accept authority
         if req.term > state["current_term"]:
             state["current_term"] = req.term
-            state["voted_for"] = None
+            state["voted_for"]    = None
 
-        state["role"] = NodeState.FOLLOWER
+        state["role"]      = NodeState.FOLLOWER
         state["leader_id"] = req.leader_id
         heartbeat_event.set()
 
@@ -530,9 +478,7 @@ async def append_entries(req: AppendEntriesRequest):
             if len(state["log"]) <= req.prev_log_index:
                 log.info(
                     "[%s] AppendEntries REJECT | missing prev_log_index=%d | our_len=%d",
-                    REPLICA_ID,
-                    req.prev_log_index,
-                    len(state["log"]),
+                    REPLICA_ID, req.prev_log_index, len(state["log"]),
                 )
                 return AppendEntriesResponse(
                     term=state["current_term"],
@@ -542,11 +488,10 @@ async def append_entries(req: AppendEntriesRequest):
 
             if state["log"][req.prev_log_index]["term"] != req.prev_log_term:
                 # Conflicting entry — truncate
-                state["log"] = state["log"][: req.prev_log_index]
+                state["log"] = state["log"][:req.prev_log_index]
                 log.info(
                     "[%s] AppendEntries REJECT | term mismatch at index=%d — truncated",
-                    REPLICA_ID,
-                    req.prev_log_index,
+                    REPLICA_ID, req.prev_log_index,
                 )
                 return AppendEntriesResponse(
                     term=state["current_term"],
@@ -584,9 +529,9 @@ async def heartbeat(req: HeartbeatRequest):
 
         if req.term > state["current_term"]:
             state["current_term"] = req.term
-            state["voted_for"] = None
+            state["voted_for"]    = None
 
-        state["role"] = NodeState.FOLLOWER
+        state["role"]      = NodeState.FOLLOWER
         state["leader_id"] = req.leader_id
         heartbeat_event.set()
 
@@ -602,15 +547,12 @@ async def sync_log(req: SyncLogRequest):
     """
     async with state_lock:
         committed = [
-            e
-            for e in state["log"]
+            e for e in state["log"]
             if e["index"] >= req.from_index and e["index"] <= state["commit_index"]
         ]
         log.info(
             "[%s] /sync-log | from=%d | sending=%d entries",
-            REPLICA_ID,
-            req.from_index,
-            len(committed),
+            REPLICA_ID, req.from_index, len(committed),
         )
         return SyncLogResponse(
             entries=[LogEntry(**e) for e in committed],
@@ -635,30 +577,26 @@ async def receive_stroke(payload: StrokePayload):
                 status_code=409,
                 detail=f"{REPLICA_ID} is not the leader (role={state['role']})",
             )
-        term = state["current_term"]
+        term      = state["current_term"]
         new_index = last_log_index() + 1
-        prev_idx = new_index - 1
-        prev_term = (
-            state["log"][prev_idx]["term"] if prev_idx >= 0 and state["log"] else 0
-        )
+        prev_idx  = new_index - 1
+        prev_term = state["log"][prev_idx]["term"] if prev_idx >= 0 and state["log"] else 0
         commit_idx = state["commit_index"]
 
         new_entry = {"index": new_index, "term": term, "entry": payload.dict()}
         state["log"].append(new_entry)
         log.info(
             "[%s] Stroke appended | index=%d | stroke_id=%s",
-            REPLICA_ID,
-            new_index,
-            payload.stroke_id,
+            REPLICA_ID, new_index, payload.stroke_id,
         )
 
     ae_req = {
-        "term": term,
-        "leader_id": REPLICA_ID,
+        "term":           term,
+        "leader_id":      REPLICA_ID,
         "prev_log_index": prev_idx,
-        "prev_log_term": prev_term,
-        "entries": [new_entry],
-        "leader_commit": commit_idx,
+        "prev_log_term":  prev_term,
+        "entries":        [new_entry],
+        "leader_commit":  commit_idx,
     }
 
     async def replicate_to(peer_url: str) -> bool:
@@ -682,18 +620,18 @@ async def receive_stroke(payload: StrokePayload):
             their_match = data.get("match_index", -1)
             log.info(
                 "[%s] Follower %s is behind (match_index=%d) — scheduling catch-up",
-                REPLICA_ID,
-                peer_url,
-                their_match,
+                REPLICA_ID, peer_url, their_match,
             )
             asyncio.create_task(_sync_follower(peer_url, their_match + 1))
             return False
         except Exception as exc:
-            log.warning("[%s] AppendEntries → %s failed: %s", REPLICA_ID, peer_url, exc)
+            log.warning(
+                "[%s] AppendEntries → %s failed: %s", REPLICA_ID, peer_url, exc
+            )
             return False
 
     results = await asyncio.gather(*[replicate_to(p) for p in PEERS])
-    acks = 1 + sum(1 for r in results if r)  # 1 = self
+    acks = 1 + sum(1 for r in results if r)   # 1 = self
 
     if acks >= 2:
         async with state_lock:
@@ -701,10 +639,7 @@ async def receive_stroke(payload: StrokePayload):
                 state["commit_index"] = new_index
                 log.info(
                     "[%s] Stroke COMMITTED | index=%d | acks=%d | stroke_id=%s",
-                    REPLICA_ID,
-                    new_index,
-                    acks,
-                    payload.stroke_id,
+                    REPLICA_ID, new_index, acks, payload.stroke_id,
                 )
 
         await _notify_gateway(payload.dict())
@@ -712,9 +647,7 @@ async def receive_stroke(payload: StrokePayload):
 
     log.warning(
         "[%s] Stroke NOT committed | acks=%d | stroke_id=%s",
-        REPLICA_ID,
-        acks,
-        payload.stroke_id,
+        REPLICA_ID, acks, payload.stroke_id,
     )
     raise HTTPException(
         status_code=503,
@@ -731,8 +664,6 @@ async def _notify_gateway(stroke: dict):
                 json=stroke,
                 timeout=RPC_TIMEOUT,
             )
-        log.info(
-            "[%s] Gateway notified | stroke_id=%s", REPLICA_ID, stroke.get("stroke_id")
-        )
+        log.info("[%s] Gateway notified | stroke_id=%s", REPLICA_ID, stroke.get("stroke_id"))
     except Exception as exc:
         log.warning("[%s] Gateway notify failed: %s", REPLICA_ID, exc)
