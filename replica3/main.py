@@ -141,8 +141,12 @@ async def _sync_follower(peer_url: str, from_index: int):
         async with httpx.AsyncClient() as client:
             r = await client.post(
                 f"{peer_url}/sync-log",
-                json={"from_index": from_index},
-                timeout=2.0,   # longer timeout — could be a big payload
+                json={
+                    "from_index":   from_index,
+                    "entries":      committed,
+                    "commit_index": commit_idx,
+                },
+                timeout=2.0,
             )
         if r.status_code == 200:
             log.info(
@@ -156,6 +160,44 @@ async def _sync_follower(peer_url: str, from_index: int):
             )
     except Exception as exc:
         log.warning("[%s] Catch-up sync error → %s: %s", REPLICA_ID, peer_url, exc)
+
+async def _catch_up_from_leader(leader_url: str, from_index: int):
+    """
+    Follower-initiated sync: call the leader's /sync-log to request missing
+    committed entries, then apply them locally.  This is the pull path described
+    in the spec (Section 3.1B: /sync-log 'called by a rejoining node').
+    """
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.post(
+                f"{leader_url}/sync-log",
+                json={"from_index": from_index},
+                timeout=3.0,
+            )
+        if r.status_code != 200:
+            log.warning("[%s] Pull sync from %s failed | status=%d", REPLICA_ID, leader_url, r.status_code)
+            return
+        data         = r.json()
+        entries      = data.get("entries", [])
+        commit_index = data.get("commit_index", -1)
+        if not entries:
+            return
+        async with state_lock:
+            for e in entries:
+                idx = e["index"]
+                if idx >= len(state["log"]):
+                    state["log"].append(e)
+                elif state["log"][idx]["term"] != e["term"]:
+                    state["log"] = state["log"][:idx]
+                    state["log"].append(e)
+            if commit_index > state["commit_index"]:
+                state["commit_index"] = min(commit_index, last_log_index())
+        log.info(
+            "[%s] Pull sync OK from %s | applied=%d entries | commit_index → %d",
+            REPLICA_ID, leader_url, len(entries), commit_index,
+        )
+    except Exception as exc:
+        log.warning("[%s] Pull sync from %s error: %s", REPLICA_ID, leader_url, exc)
 
 # ─── Election loop ────────────────────────────────────────────────────────────
 
@@ -375,7 +417,9 @@ class HeartbeatResponse(BaseModel):
     success: bool
 
 class SyncLogRequest(BaseModel):
-    from_index: int
+    from_index:   int
+    entries:      Optional[List[LogEntry]] = None   # present on leader-push path
+    commit_index: Optional[int]            = None   # present on leader-push path
 
 class SyncLogResponse(BaseModel):
     entries:      List[LogEntry]
@@ -476,14 +520,17 @@ async def append_entries(req: AppendEntriesRequest):
         # Log consistency check
         if req.prev_log_index >= 0:
             if len(state["log"]) <= req.prev_log_index:
+                our_len    = len(state["log"])
+                leader_url = req.leader_id
                 log.info(
-                    "[%s] AppendEntries REJECT | missing prev_log_index=%d | our_len=%d",
-                    REPLICA_ID, req.prev_log_index, len(state["log"]),
+                    "[%s] AppendEntries REJECT | missing prev_log_index=%d | our_len=%d — triggering pull sync",
+                    REPLICA_ID, req.prev_log_index, our_len,
                 )
+                asyncio.create_task(_catch_up_from_leader(leader_url, our_len))
                 return AppendEntriesResponse(
                     term=state["current_term"],
                     success=False,
-                    match_index=len(state["log"]) - 1,
+                    match_index=our_len - 1,
                 )
 
             if state["log"][req.prev_log_index]["term"] != req.prev_log_term:
@@ -541,23 +588,48 @@ async def heartbeat(req: HeartbeatRequest):
 @app.post("/sync-log", response_model=SyncLogResponse)
 async def sync_log(req: SyncLogRequest):
     """
-    Return all committed log entries from req.from_index onward.
-    Called by the leader on a rejoining follower (Phase 3).
-    Already functional — Phase 3 just wires the leader to call it.
+    Dual-mode endpoint:
+
+    Pull path (entries=None): a rejoining follower calls this on the leader.
+      The leader returns its committed entries from from_index onward.
+      Spec ref: Section 3.1B — '/sync-log called by a rejoining node'.
+
+    Push path (entries provided): the leader calls this on a lagging follower,
+      pushing all missing committed entries so the follower can apply them.
+      Triggered by heartbeat_loop via _sync_follower().
     """
     async with state_lock:
-        committed = [
-            e for e in state["log"]
-            if e["index"] >= req.from_index and e["index"] <= state["commit_index"]
-        ]
-        log.info(
-            "[%s] /sync-log | from=%d | sending=%d entries",
-            REPLICA_ID, req.from_index, len(committed),
-        )
-        return SyncLogResponse(
-            entries=[LogEntry(**e) for e in committed],
-            commit_index=state["commit_index"],
-        )
+        if req.entries is not None:
+            # Push path — apply entries sent by the leader
+            for e in req.entries:
+                entry_dict = e.dict()
+                idx = entry_dict["index"]
+                if idx >= len(state["log"]):
+                    state["log"].append(entry_dict)
+                elif state["log"][idx]["term"] != entry_dict["term"]:
+                    state["log"] = state["log"][:idx]
+                    state["log"].append(entry_dict)
+            if req.commit_index is not None and req.commit_index > state["commit_index"]:
+                state["commit_index"] = min(req.commit_index, last_log_index())
+            log.info(
+                "[%s] /sync-log push | applied=%d entries | commit_index → %d",
+                REPLICA_ID, len(req.entries), state["commit_index"],
+            )
+            return SyncLogResponse(entries=[], commit_index=state["commit_index"])
+        else:
+            # Pull path — return our committed entries to the calling follower
+            committed = [
+                e for e in state["log"]
+                if e["index"] >= req.from_index and e["index"] <= state["commit_index"]
+            ]
+            log.info(
+                "[%s] /sync-log pull | from=%d | sending=%d entries",
+                REPLICA_ID, req.from_index, len(committed),
+            )
+            return SyncLogResponse(
+                entries=[LogEntry(**e) for e in committed],
+                commit_index=state["commit_index"],
+            )
 
 
 @app.post("/stroke")
